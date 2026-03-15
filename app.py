@@ -1,10 +1,12 @@
 import requests
 import streamlit as st
+import threading
+import time
 
 # =============================
 # CONFIG
 # =============================
-API_BASE = "https://movie-rec-466x.onrender.com" or "http://127.0.0.1:8000"
+API_BASE = "https://aibasedmovie-recom-5.onrender.com"
 TMDB_IMG = "https://image.tmdb.org/t/p/w500"
 
 st.set_page_config(page_title="CineScope", page_icon="C", layout="wide")
@@ -383,6 +385,24 @@ h2, h3 {
 )
 
 # =============================
+# KEEP-ALIVE (pings backend every 10 min to prevent Render sleep)
+# =============================
+def keep_alive():
+    while True:
+        try:
+            requests.get(
+                f"{API_BASE}/health",
+                timeout=10
+            )
+        except Exception:
+            pass
+        time.sleep(600)  # every 10 minutes
+
+thread = threading.Thread(target=keep_alive, daemon=True)
+thread.start()
+
+
+# =============================
 # STATE + ROUTING
 # =============================
 if "view" not in st.session_state:
@@ -390,15 +410,19 @@ if "view" not in st.session_state:
 if "selected_tmdb_id" not in st.session_state:
     st.session_state.selected_tmdb_id = None
 
-qp_view = st.query_params.get("view")
-qp_id   = st.query_params.get("id")
+
+try:
+    qp_view = st.query_params.get("view")
+except AttributeError:
+    qp_view = st.experimental_get_query_params().get("view", [None])[0]
+qp_id = st.query_params.get("id")
 if qp_view in ("home", "details"):
     st.session_state.view = qp_view
 if qp_id:
     try:
         st.session_state.selected_tmdb_id = int(qp_id)
         st.session_state.view = "details"
-    except:
+    except Exception:
         pass
 
 
@@ -423,13 +447,20 @@ def goto_details(tmdb_id: int):
 # =============================
 @st.cache_data(ttl=30)
 def api_get_json(path: str, params: dict | None = None):
-    try:
-        r = requests.get(f"{API_BASE}{path}", params=params, timeout=25)
-        if r.status_code >= 400:
-            return None, f"HTTP {r.status_code}: {r.text[:300]}"
-        return r.json(), None
-    except Exception as e:
-        return None, f"Request failed: {e}"
+    """Fetch JSON from backend with simple retry logic."""
+    last_err = None
+    for attempt in range(3):
+        try:
+            r = requests.get(f"{API_BASE}{path}", params=params, timeout=60)
+            if r.status_code >= 400:
+                return None, f"HTTP {r.status_code}: {r.text[:300]}"
+            return r.json(), None
+        except requests.exceptions.Timeout:
+            last_err = "Request timed out. The server may be waking up — please try again."
+        except Exception as e:
+            last_err = f"Request failed: {e}"
+        time.sleep(2 ** attempt)  # wait 1s, 2s before retrying
+    return None, last_err
 
 
 def render_movie_card(col, m, key):
@@ -460,7 +491,7 @@ def render_movie_card(col, m, key):
                     f"<span class='mi mi-sm'>star</span>{float(rating):.1f}"
                     f"</span>"
                 )
-            except:
+            except Exception:
                 pass
 
         st.markdown(
@@ -773,7 +804,7 @@ elif st.session_state.view == "details":
                 meta_parts.append(
                     f"<span><span class='mi mi-sm'>star</span>{float(rating):.1f} / 10</span>"
                 )
-            except:
+            except Exception:
                 pass
         if runtime:
             h, m = divmod(int(runtime), 60)
