@@ -1,15 +1,18 @@
 import pickle
+import os
+import sys
+import re
 from typing import Optional, List, Dict, Any, Tuple
+
 import numpy as np
 import pandas as pd
 import httpx
-import os
-import sys
-from fastapi.responses import JSONResponse
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
+import uvicorn
 
 # Load environment variables
 load_dotenv()
@@ -19,7 +22,7 @@ TMDB_BASE = "https://api.themoviedb.org/3"
 TMDB_IMG_500 = "https://image.tmdb.org/t/p/w500"
 
 if not TMDB_API_KEY:
-    raise RuntimeError("TMDB_API_KEY missing. Please add it to .env file as: TMDB_API_KEY=your_api_key_here")
+    print("⚠️ WARNING: TMDB_API_KEY missing. Please add it to environment variables.")
 
 app = FastAPI(title="Movie Recommender API", version="3.0")
 
@@ -42,6 +45,7 @@ indices_obj: Any = None
 tfidf_matrix: Any = None
 tfidf_obj: Any = None
 TITLE_TO_IDX: Optional[Dict[str, int]] = None
+
 
 # =========================
 # PYDANTIC MODELS
@@ -72,6 +76,7 @@ class SearchBundleResponse(BaseModel):
     movie_details: TMDBMovieDetails
     tfidf_recommendations: List[TFIDFRecItem]
     genre_recommendations: List[TMDBMovieCard]
+
 
 # =========================
 # UTILITY FUNCTIONS
@@ -150,6 +155,7 @@ async def tmdb_search_first(query: str) -> Optional[dict]:
     except Exception as e:
         print(f"⚠️ Error in tmdb_search_first: {e}")
         return None
+
 
 # =========================
 # TF-IDF HELPER FUNCTIONS
@@ -234,7 +240,6 @@ def get_local_idx_by_title(title: str) -> int:
         if key in stored_title or stored_title in key:
             return int(idx)
 
-    import re
     key_clean = re.sub(r'[^\w\s]', '', key)
     for stored_title, idx in TITLE_TO_IDX.items():
         stored_clean = re.sub(r'[^\w\s]', '', stored_title)
@@ -298,18 +303,19 @@ async def attach_tmdb_card_by_title(title: str) -> Optional[TMDBMovieCard]:
         print(f"⚠️ Error attaching TMDB card for '{title}': {e}")
         return None
 
+
 # =========================
 # STARTUP: LOAD PICKLE FILES
 # =========================
 @app.on_event("startup")
 def load_pickles():
-    global df, indices_obj, tfidf_matrix, tfidf_obj, TITLE_TO_IDX  # ← only once, right at the top
+    global df, indices_obj, tfidf_matrix, tfidf_obj, TITLE_TO_IDX
 
     print("=" * 60)
     print("🚀 LOADING PICKLE FILES")
     print("=" * 60)
 
-    # Check files exist
+    # Check files exist — WARNING only, do NOT crash
     files_to_check = {
         "df.pkl": DF_PATH,
         "indices.pkl": INDICES_PATH,
@@ -324,8 +330,11 @@ def load_pickles():
             size = os.path.getsize(path) / 1024
             print(f"✅ Found {name} ({size:.2f} KB)")
 
+    # ✅ FIX: Don't crash if files missing — just warn
     if missing_files:
-        raise RuntimeError(f"Required files missing: {', '.join(missing_files)}")
+        print(f"⚠️ WARNING: Missing files: {', '.join(missing_files)}")
+        print("⚠️ App will start but recommendations may not work")
+        return
 
     # Load DataFrame
     print("\n📊 Loading DataFrame...")
@@ -354,12 +363,15 @@ def load_pickles():
                     with open(DF_PATH, "rb") as f:
                         df = pickle.load(f, encoding='latin1')
                     print("✅ Loaded with latin1 encoding")
-                except Exception:
-                    raise RuntimeError("Could not load df.pkl with any method")
+                except Exception as ex:
+                    print(f"❌ Could not load df.pkl: {ex}")
+                    return
         else:
-            raise RuntimeError(f"Failed to load df.pkl: {e}")
+            print(f"❌ Failed to load df.pkl: {e}")
+            return
     except Exception as e:
-        raise RuntimeError(f"Failed to load df.pkl: {e}")
+        print(f"❌ Failed to load df.pkl: {e}")
+        return
 
     # Load indices
     print("\n🔢 Loading indices...")
@@ -374,12 +386,6 @@ def load_pickles():
             with open(INDICES_PATH, "rb") as f:
                 indices_obj = load_func(f)
             print(f"✅ Indices loaded with {method_name}. Type: {type(indices_obj)}")
-            if isinstance(indices_obj, dict):
-                print(f"   Sample: {dict(list(indices_obj.items())[:3])}")
-            elif hasattr(indices_obj, 'items'):
-                print(f"   Sample: {dict(list(indices_obj.items())[:3])}")
-            elif isinstance(indices_obj, (list, np.ndarray)):
-                print(f"   First 5: {indices_obj[:5]}")
             break
         except Exception as e:
             print(f"⚠️ {method_name} failed: {e}")
@@ -392,21 +398,12 @@ def load_pickles():
     print("\n🔢 Loading TF-IDF matrix...")
     try:
         with open(TFIDF_MATRIX_PATH, "rb") as f:
-            try:
-                tfidf_matrix = pickle.load(f)
-            except ModuleNotFoundError as e:
-                if 'scipy' in str(e):
-                    print("❌ Scipy not found. Installing...")
-                    import subprocess
-                    subprocess.check_call([sys.executable, "-m", "pip", "install", "scipy==1.10.0"])
-                    with open(TFIDF_MATRIX_PATH, "rb") as f2:
-                        tfidf_matrix = pickle.load(f2)
-                else:
-                    raise
+            tfidf_matrix = pickle.load(f)
         if hasattr(tfidf_matrix, 'shape'):
             print(f"✅ TF-IDF matrix loaded. Shape: {tfidf_matrix.shape}")
     except Exception as e:
-        raise RuntimeError(f"Failed to load tfidf_matrix.pkl: {e}")
+        print(f"❌ Failed to load tfidf_matrix.pkl: {e}")
+        return
 
     # Load TF-IDF vectorizer (optional)
     print("\n🔧 Loading TF-IDF vectorizer...")
@@ -417,16 +414,6 @@ def load_pickles():
             print("✅ TF-IDF vectorizer loaded.")
         else:
             print("⚠️ tfidf.pkl not found - continuing without it")
-            tfidf_obj = None
-    except ModuleNotFoundError as e:
-        if 'sklearn' in str(e):
-            print("⚠️ scikit-learn not found - installing...")
-            import subprocess
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "scikit-learn==1.2.2"])
-            with open(TFIDF_PATH, "rb") as f:
-                tfidf_obj = pickle.load(f)
-            print("✅ TF-IDF vectorizer loaded after installing sklearn")
-        else:
             tfidf_obj = None
     except Exception as e:
         print(f"⚠️ Could not load tfidf.pkl: {e}")
@@ -450,15 +437,16 @@ def load_pickles():
 
     # Final validation
     print("\n🔍 Final validation:")
-    print(f"   DataFrame:    {'✅' if df is not None else '❌'}")
-    print(f"   Title map:    {'✅' if TITLE_TO_IDX else '❌'} ({len(TITLE_TO_IDX) if TITLE_TO_IDX else 0} entries)")
-    print(f"   TF-IDF matrix:{'✅' if tfidf_matrix is not None else '❌'}")
+    print(f"   DataFrame:     {'✅' if df is not None else '❌'}")
+    print(f"   Title map:     {'✅' if TITLE_TO_IDX else '❌'} ({len(TITLE_TO_IDX) if TITLE_TO_IDX else 0} entries)")
+    print(f"   TF-IDF matrix: {'✅' if tfidf_matrix is not None else '❌'}")
 
     if TITLE_TO_IDX and tfidf_matrix is not None:
         print("\n🎬 SUCCESS: All systems ready!")
     else:
         print("\n⚠️ WARNING: Some components failed to load")
     print("=" * 60)
+
 
 # =========================
 # API ROUTES
@@ -587,6 +575,7 @@ async def search_bundle(
         genre_recommendations=genre_recs,
     )
 
+
 # =========================
 # ERROR HANDLERS
 # =========================
@@ -598,3 +587,12 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 async def general_exception_handler(request: Request, exc: Exception):
     print(f"❌ Unhandled exception: {exc}")
     return JSONResponse(status_code=500, content={"detail": "Internal server error", "success": False})
+
+
+# =========================
+# ✅ PORT BINDING FIX
+# =========================
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
+    
