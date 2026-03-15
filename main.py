@@ -2,6 +2,7 @@ import pickle
 import os
 import sys
 import re
+import asyncio
 from typing import Optional, List, Dict, Any, Tuple
 
 import numpy as np
@@ -91,24 +92,37 @@ def make_img_url(path: Optional[str]) -> Optional[str]:
         return None
     return f"{TMDB_IMG_500}{path}"
 
-async def tmdb_get(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
+async def tmdb_get(path: str, params: Dict[str, Any], retries: int = 3) -> Dict[str, Any]:
     q = dict(params)
     q["api_key"] = TMDB_API_KEY
-    try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            r = await client.get(f"{TMDB_BASE}{path}", params=q)
-    except httpx.TimeoutException:
-        raise HTTPException(status_code=504, detail="TMDB request timeout")
-    except httpx.RequestError as e:
-        raise HTTPException(status_code=502, detail=f"TMDB connection error: {str(e)}")
 
-    if r.status_code == 404:
-        raise HTTPException(status_code=404, detail="Resource not found on TMDB")
-    elif r.status_code == 401:
-        raise HTTPException(status_code=502, detail="Invalid TMDB API key")
-    elif r.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"TMDB error {r.status_code}: {r.text[:200]}")
-    return r.json()
+    last_error = None
+    for attempt in range(retries):
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                r = await client.get(f"{TMDB_BASE}{path}", params=q)
+
+            if r.status_code == 404:
+                raise HTTPException(status_code=404, detail="Resource not found on TMDB")
+            elif r.status_code == 401:
+                raise HTTPException(status_code=502, detail="Invalid TMDB API key")
+            elif r.status_code != 200:
+                raise HTTPException(status_code=502, detail=f"TMDB error {r.status_code}: {r.text[:200]}")
+            return r.json()
+
+        except HTTPException:
+            raise  # Don't retry HTTP errors like 404, 401
+        except httpx.TimeoutException:
+            last_error = f"TMDB request timed out (attempt {attempt + 1})"
+            print(f"⚠️ {last_error}")
+        except httpx.RequestError as e:
+            last_error = f"TMDB connection error: {str(e)}"
+            print(f"⚠️ {last_error} (attempt {attempt + 1})")
+
+        if attempt < retries - 1:
+            await asyncio.sleep(2 ** attempt)  # wait 1s, 2s before retrying
+
+    raise HTTPException(status_code=502, detail=last_error or "TMDB connection failed after retries")
 
 async def tmdb_cards_from_results(results: List[dict], limit: int = 20) -> List[TMDBMovieCard]:
     out: List[TMDBMovieCard] = []
@@ -138,6 +152,8 @@ async def tmdb_movie_details(movie_id: int) -> TMDBMovieDetails:
             backdrop_url=make_img_url(data.get("backdrop_path")),
             genres=data.get("genres", []) or [],
         )
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching movie details: {str(e)}")
 
@@ -315,7 +331,6 @@ def load_pickles():
     print("🚀 LOADING PICKLE FILES")
     print("=" * 60)
 
-    # Check files exist — WARNING only, do NOT crash
     files_to_check = {
         "df.pkl": DF_PATH,
         "indices.pkl": INDICES_PATH,
@@ -330,7 +345,6 @@ def load_pickles():
             size = os.path.getsize(path) / 1024
             print(f"✅ Found {name} ({size:.2f} KB)")
 
-    # ✅ FIX: Don't crash if files missing — just warn
     if missing_files:
         print(f"⚠️ WARNING: Missing files: {', '.join(missing_files)}")
         print("⚠️ App will start but recommendations may not work")
@@ -435,7 +449,6 @@ def load_pickles():
             print("❌ Cannot build emergency fallback")
             TITLE_TO_IDX = {}
 
-    # Final validation
     print("\n🔍 Final validation:")
     print(f"   DataFrame:     {'✅' if df is not None else '❌'}")
     print(f"   Title map:     {'✅' if TITLE_TO_IDX else '❌'} ({len(TITLE_TO_IDX) if TITLE_TO_IDX else 0} entries)")
@@ -497,6 +510,8 @@ async def tmdb_search(
 ):
     try:
         return await tmdb_search_movies(query=query, page=page)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
 
@@ -520,6 +535,8 @@ async def recommend_genre(
         )
         cards = await tmdb_cards_from_results(discover.get("results", []), limit=limit)
         return [c for c in cards if c.tmdb_id != tmdb_id]
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Genre recommendation failed: {str(e)}")
 
@@ -590,9 +607,8 @@ async def general_exception_handler(request: Request, exc: Exception):
 
 
 # =========================
-# ✅ PORT BINDING FIX
+# PORT BINDING
 # =========================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
-    
