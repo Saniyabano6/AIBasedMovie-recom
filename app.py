@@ -737,7 +737,7 @@ elif st.session_state.view == "details":
 
     with left:
         if data.get("poster_url"):
-            st.image(data["poster_url"], use_container_width=True)
+            st.image(data["poster_url"], use_column_width=True)
         else:
             st.markdown(
                 "<div class='no-poster' style='height:420px;border-radius:14px'>"
