@@ -443,7 +443,7 @@ def render_movie_card(col, m, key):
         st.markdown("<div class='movie-card'>", unsafe_allow_html=True)
 
         if poster:
-            st.image(poster, use_container_width=True)
+            st.image(poster, use_column_width=True)
         else:
             st.markdown(
                 "<div class='no-poster'><span class='mi'>movie</span></div>",
